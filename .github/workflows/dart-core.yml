@@ -120,7 +120,7 @@ jobs:
       contents: write
     steps:
       - name: Download verified artifact
-        uses: actions/download-artifact@3e5f45b2cf47643c292f7107632f7a47c1df5cd8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: dart-mihomo-windows-amd64
           path: dist
@@ -132,7 +132,7 @@ jobs:
           VERSION="$(cat dist/VERSION.txt)"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=v$VERSION" >> "$GITHUB_ENV"
-          sha256sum -c dist/SHA256SUMS.txt
+          (cd dist && sha256sum -c SHA256SUMS.txt)
 
       - name: Publish Dart Mihomo core
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8
@@ -140,7 +140,7 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: Mihomo ${{ env.VERSION }} for Dart
           target_commitish: ${{ github.sha }}
-          prerelease: true
+          prerelease: false
           generate_release_notes: true
           files: |
             dist/mihomo-windows-amd64-*.zip
