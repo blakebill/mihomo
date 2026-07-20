@@ -56,6 +56,7 @@ func newSmartWithProxies(t *testing.T, proxies ...C.Proxy) *Smart {
 }
 
 func TestSmartDialContextRetriesOnFailure(t *testing.T) {
+	t.Parallel()
 	var badCalls, goodCalls atomic.Int32
 	bad := adapter.NewProxy(&mockProxy{
 		Base:  outbound.NewBase(outbound.BaseOption{Name: "bad", Type: C.Direct}),
@@ -90,6 +91,7 @@ func TestSmartDialContextRetriesOnFailure(t *testing.T) {
 }
 
 func TestSmartDialContextSoftFailRetries(t *testing.T) {
+	t.Parallel()
 	var slowCalls, fastCalls atomic.Int32
 	slow := adapter.NewProxy(&mockProxy{
 		Base:  outbound.NewBase(outbound.BaseOption{Name: "slow", Type: C.Direct}),
@@ -122,6 +124,7 @@ func TestSmartDialContextSoftFailRetries(t *testing.T) {
 }
 
 func TestSmartDialContextFallsBackWhenAllFail(t *testing.T) {
+	t.Parallel()
 	bad1 := adapter.NewProxy(&mockProxy{
 		Base: outbound.NewBase(outbound.BaseOption{Name: "a", Type: C.Direct}),
 		fail: true,

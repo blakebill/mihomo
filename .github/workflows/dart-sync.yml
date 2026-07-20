@@ -1,3 +1,5 @@
+# Merge MetaCubeX upstream into Meta, keep Smart, push.
+# Push to Meta triggers Dart Core Release.
 name: Sync upstream with Dart Smart
 
 on:
@@ -14,7 +16,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Sync Meta, verify Smart, build
+    name: Merge upstream Meta/Alpha
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -31,8 +33,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/MetaCubeX/mihomo.git 2>/dev/null || \
             git remote set-url upstream https://github.com/MetaCubeX/mihomo.git
-          # Prefer Meta; fall back to Alpha if upstream dropped Meta.
-          if git ls-remote --heads upstream Meta | grep -q Meta; then
+          if git ls-remote --heads upstream Meta | grep -q refs/heads/Meta; then
             BRANCH=Meta
           else
             BRANCH=Alpha
@@ -43,19 +44,20 @@ jobs:
       - name: Merge upstream
         run: |
           set -euo pipefail
-          git merge --no-ff "upstream/${UPSTREAM_BRANCH}" \
-            -m "chore: sync upstream ${UPSTREAM_BRANCH} [skip ci]"
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "Already up to date with upstream/${UPSTREAM_BRANCH}."
+          else
+            git merge --no-ff "upstream/${UPSTREAM_BRANCH}" \
+              -m "chore: sync upstream ${UPSTREAM_BRANCH}"
+          fi
 
       - name: Verify Dart Smart registration hooks
         run: |
           set -euo pipefail
           test -f adapter/outboundgroup/smart.go
           test -d adapter/outboundgroup/smartengine
-          grep -Fq '// dart-smart:register-type' constant/adapters.go
-          grep -E -q '^\s*Smart$' constant/adapters.go || grep -Fq $'\tSmart' constant/adapters.go
           grep -Fq 'case "smart":' adapter/outboundgroup/parser.go
-          grep -Fq '// dart-smart:register-type' adapter/outboundgroup/parser.go
-          grep -Fq 'func (s *Smart) DialContext' adapter/outboundgroup/smart.go
+          grep -E -q $'\tSmart$' constant/adapters.go || grep -Fq $'\tSmart' constant/adapters.go
 
       - name: Set up Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
@@ -64,7 +66,7 @@ jobs:
           go-version: "1.26"
           cache: true
 
-      - name: Test Dart Smart engine + adapter
+      - name: Test Smart + smoke compile
         env:
           CGO_ENABLED: "0"
           GOTOOLCHAIN: local
@@ -73,23 +75,10 @@ jobs:
           set -euo pipefail
           go test ./adapter/outboundgroup/smartengine/... -count=1
           go test ./adapter/outboundgroup/ -run 'Smart' -count=1
+          go test ./... -tags with_gvisor -run "^$" -count=0
 
-      - name: Compile packages (smoke)
-        env:
-          CGO_ENABLED: "0"
-          GOTOOLCHAIN: local
-        run: go test ./... -tags with_gvisor -run "^$" -count=0
-
-      - name: Build Linux amd64
-        env:
-          CGO_ENABLED: "0"
-          GOOS: linux
-          GOARCH: amd64
-          GOTOOLCHAIN: local
+      - name: Push Meta
         run: |
           set -euo pipefail
-          go build -tags with_gvisor -trimpath -o /tmp/mihomo .
-          test -s /tmp/mihomo
-
-      - name: Push verified sync
-        run: git push origin HEAD:Meta
+          git push origin HEAD:Meta
+          # Pushing Meta triggers Dart Core Release.

@@ -1,4 +1,5 @@
-name: Dart Core
+# Build CURRENT Meta branch (includes Smart) and publish a Windows GitHub Release.
+name: Dart Core Release
 
 on:
   push:
@@ -11,27 +12,38 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Base version or complete Dart version (for example 1.19.29 or 1.19.29-dart.1)"
+        description: "Optional full Dart version (e.g. 1.19.29-dart.4). Empty = auto."
         required: false
         type: string
+  schedule:
+    - cron: "37 3 * * *"
 
-permissions: {}
+permissions:
+  contents: write
 
 concurrency:
-  group: dart-core-${{ github.ref }}
+  group: dart-core-release
   cancel-in-progress: true
 
 jobs:
-  build-windows-amd64:
+  build-and-publish:
     runs-on: windows-latest
-    permissions:
-      contents: read
+    timeout-minutes: 40
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          persist-credentials: false
           fetch-depth: 0
+
+      - name: Verify Dart Smart is present
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "adapter/outboundgroup/smart.go")) { throw "missing smart.go" }
+          if (-not (Test-Path "adapter/outboundgroup/smartengine")) { throw "missing smartengine" }
+          $adapters = Get-Content "constant/adapters.go" -Raw
+          if ($adapters -notmatch '(?m)^\s*Smart\s*$') { throw "Smart type not registered" }
+          $parser = Get-Content "adapter/outboundgroup/parser.go" -Raw
+          if ($parser -notmatch 'case "smart":') { throw "parser missing case smart" }
 
       - name: Set up Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
@@ -46,17 +58,37 @@ jobs:
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          $base = $env:REQUESTED_VERSION.Trim().TrimStart('v')
-          if (-not $base) {
-            $base = (git describe --tags --match "v[0-9]*" --abbrev=0).Trim().TrimStart('v')
+          $req = ""
+          if ($env:REQUESTED_VERSION) {
+            $req = $env:REQUESTED_VERSION.Trim().TrimStart('v')
           }
-          if ($base -match '-dart\.[0-9]+$') {
-            $version = $base
+          if ($req) {
+            $version = $req
           } else {
+            $base = ""
+            try {
+              $base = (git describe --tags --match "v[0-9]*" --abbrev=0).Trim().TrimStart('v')
+            } catch {}
+            if (-not $base) { $base = "0.0.0" }
+            # Strip previous -dart.N so every run gets a unique tag
+            $base = [regex]::Replace($base, '-dart\.[0-9]+$', '')
             $version = "$base-dart.${{ github.run_number }}"
           }
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=v$version" >> $env:GITHUB_OUTPUT
+          Write-Host "version=$version tag=v$version sha=$(git rev-parse --short HEAD)"
+
+      - name: Test Smart
+        shell: pwsh
+        env:
+          CGO_ENABLED: "0"
+          GOTOOLCHAIN: local
+          SKIP_INTEROP_TEST: "1"
+        run: |
+          go test ./adapter/outboundgroup/smartengine/... -count=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test ./adapter/outboundgroup/ -run "Smart" -count=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Compile packages
         shell: pwsh
@@ -102,46 +134,30 @@ jobs:
           $env:VERSION | Out-File dist/VERSION.txt -Encoding ascii -NoNewline
           "archive=$archive" >> $env:GITHUB_OUTPUT
 
-      - name: Upload core artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: dart-mihomo-windows-amd64
-          path: |
-            dist/mihomo-windows-amd64-*.zip
-            dist/SHA256SUMS.txt
-            dist/VERSION.txt
-          if-no-files-found: error
-          retention-days: 14
-
-  publish:
-    needs: build-windows-amd64
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download verified artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: dart-mihomo-windows-amd64
-          path: dist
-
-      - name: Resolve release metadata
+      - name: Publish GitHub Release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
         run: |
           set -euo pipefail
-          VERSION="$(cat dist/VERSION.txt)"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=v$VERSION" >> "$GITHUB_ENV"
-          (cd dist && sha256sum -c SHA256SUMS.txt)
-
-      - name: Publish Dart Mihomo core
-        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: Mihomo ${{ env.VERSION }} for Dart
-          target_commitish: ${{ github.sha }}
-          prerelease: false
-          generate_release_notes: true
-          files: |
-            dist/mihomo-windows-amd64-*.zip
-            dist/SHA256SUMS.txt
+          notes="Dart-maintained Windows amd64 mihomo (Meta) with Smart group. Commit $(git rev-parse --short HEAD)."
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              "dist/$ARCHIVE" \
+              "dist/SHA256SUMS.txt" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Mihomo $VERSION for Dart" --notes "$notes" \
+              --target "$(git rev-parse HEAD)"
+          else
+            gh release create "$RELEASE_TAG" \
+              "dist/$ARCHIVE" \
+              "dist/SHA256SUMS.txt" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Mihomo $VERSION for Dart" \
+              --notes "$notes" \
+              --target "$(git rev-parse HEAD)"
+          fi
