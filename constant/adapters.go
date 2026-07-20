@@ -30,6 +30,8 @@ const (
 	Fallback
 	URLTest
 	LoadBalance
+	// dart-smart:register-type
+	Smart
 
 	Shadowsocks
 	ShadowsocksR
@@ -246,6 +248,8 @@ func (at AdapterType) String() string {
 		return "URLTest"
 	case LoadBalance:
 		return "LoadBalance"
+	case Smart:
+		return "Smart"
 	default:
 		return "Unknown"
 	}
