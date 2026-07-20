@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/outboundgroup/smartengine"
+	"github.com/metacubex/mihomo/common/callback"
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -168,6 +170,31 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			continue
 		}
 		c.AppendToChains(s)
+		tag := candidate.Tag
+		// Defer final success until first write when the member still needs a handshake.
+		// Failure / very slow first write updates engine so the next dial failovers.
+		if N.NeedHandshake(c) {
+			hsStart := time.Now()
+			hostKey := host
+			c = callback.NewFirstWriteCallBackConn(c, func(err error) {
+				hsMs := float64(time.Since(hsStart).Milliseconds())
+				if err != nil {
+					s.eng.Record(tag, engine.OutcomeFailure, hsMs)
+					return
+				}
+				th := s.eng.SoftFailThresholdMs(tag)
+				if hsMs > th && th > 0 {
+					// Write already completed; keep the conn but mark soft-fail for ranking.
+					s.eng.Record(tag, engine.OutcomeSoftFail, hsMs)
+					return
+				}
+				s.eng.Record(tag, engine.OutcomeSuccess, hsMs)
+				s.eng.RememberHost(hostKey, tag)
+			})
+			s.selected = tag
+			s.onDialSuccess()
+			return c, nil
+		}
 		s.eng.Record(candidate.Tag, engine.OutcomeSuccess, rttMs)
 		s.eng.RememberHost(host, candidate.Tag)
 		s.selected = candidate.Tag
