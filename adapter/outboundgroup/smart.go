@@ -52,22 +52,52 @@ func NewSmart(option GroupCommonOption, _ SmartOption, emptyFallback C.Proxy, pr
 }
 
 func (s *Smart) ensureEngine(proxies []C.Proxy) {
-	if s.eng != nil {
+	if s.eng == nil {
+		tags := make([]string, 0, len(proxies))
+		for _, p := range proxies {
+			tags = append(tags, p.Name())
+		}
+		s.eng = engine.New(tags, engine.Options{})
+		if s.selected != "" {
+			s.eng.SetPreferred(s.selected)
+		}
+	}
+	// Refresh URL-test priors every dial so delay sweeps can re-rank members.
+	s.refreshURLTestPriors(proxies)
+}
+
+func (s *Smart) refreshURLTestPriors(proxies []C.Proxy) {
+	if s.eng == nil || s.testUrl == "" {
 		return
 	}
-	tags := make([]string, 0, len(proxies))
 	for _, p := range proxies {
-		tags = append(tags, p.Name())
-	}
-	s.eng = engine.New(tags, engine.Options{})
-	// Seed URL-test priors when available.
-	for _, p := range proxies {
-		if s.testUrl == "" {
-			continue
-		}
 		if d := p.LastDelayForTestUrl(s.testUrl); d > 0 && p.AliveForTestUrl(s.testUrl) {
 			s.eng.SetURLTestPrior(p.Name(), d)
 		}
+	}
+}
+
+// Set implements SelectAble so the Clash API / app can pin a preferred member.
+func (s *Smart) Set(name string) error {
+	for _, proxy := range s.GetProxies(false) {
+		if proxy.Name() != name {
+			continue
+		}
+		s.selected = name
+		s.ensureEngine(s.GetProxies(false))
+		if s.eng != nil {
+			s.eng.SetPreferred(name)
+		}
+		return nil
+	}
+	return errors.New("proxy not exist")
+}
+
+// ForceSet implements SelectAble.
+func (s *Smart) ForceSet(name string) {
+	s.selected = name
+	if s.eng != nil {
+		s.eng.SetPreferred(name)
 	}
 }
 

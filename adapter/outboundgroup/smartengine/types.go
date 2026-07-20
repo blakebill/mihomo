@@ -21,20 +21,20 @@ const (
 
 // MemberStats is per-outbound health used for selection.
 type MemberStats struct {
-	Tag                string
-	Samples            int
-	EwmaMs             float64
-	JitterMs           float64
-	FailureRate        float64
-	ConsecutiveFails   int
-	Penalty            float64
-	LastSuccess        time.Time
-	LastFailure        time.Time
-	SuccessSinceFail   int
-	Weight             float64 // policy-priority style; 1 = neutral, <1 preferred
-	Alive              bool
-	URLTestLatencyMs   uint16 // optional prior from URL test
-	HasURLTestPrior    bool
+	Tag              string
+	Samples          int
+	EwmaMs           float64
+	JitterMs         float64
+	FailureRate      float64
+	ConsecutiveFails int
+	Penalty          float64
+	LastSuccess      time.Time
+	LastFailure      time.Time
+	SuccessSinceFail int
+	Weight           float64 // policy-priority style; 1 = neutral, <1 preferred
+	Alive            bool
+	URLTestLatencyMs uint16 // optional prior from URL test
+	HasURLTestPrior  bool
 }
 
 // Options configures an Engine.
@@ -80,8 +80,11 @@ func (o Options) withDefaults() Options {
 	if o.MaxHosts <= 0 {
 		o.MaxHosts = DefaultMaxHosts
 	}
-	if o.ExploreProb < 0 {
+	// 0 means "use default exploration"; negative disables.
+	if o.ExploreProb == 0 {
 		o.ExploreProb = 0.15
+	} else if o.ExploreProb < 0 {
+		o.ExploreProb = 0
 	}
 	if o.Now == nil {
 		o.Now = time.Now
