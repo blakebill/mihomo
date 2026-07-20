@@ -52,15 +52,18 @@ func NewSmart(option GroupCommonOption, _ SmartOption, emptyFallback C.Proxy, pr
 }
 
 func (s *Smart) ensureEngine(proxies []C.Proxy) {
+	tags := make([]string, 0, len(proxies))
+	for _, p := range proxies {
+		tags = append(tags, p.Name())
+	}
 	if s.eng == nil {
-		tags := make([]string, 0, len(proxies))
-		for _, p := range proxies {
-			tags = append(tags, p.Name())
-		}
 		s.eng = engine.New(tags, engine.Options{})
 		if s.selected != "" {
 			s.eng.SetPreferred(s.selected)
 		}
+	} else {
+		// Provider membership can change; keep stats for survivors.
+		s.eng.SyncMembers(tags)
 	}
 	// Refresh URL-test priors every dial so delay sweeps can re-rank members.
 	s.refreshURLTestPriors(proxies)

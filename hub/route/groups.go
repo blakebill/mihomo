@@ -59,9 +59,16 @@ func getGroupDelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if selectAble, ok := proxy.Adapter().(outboundgroup.SelectAble); ok && proxy.Type() != C.Selector {
-		selectAble.ForceSet("")
-		cachefile.Cache().SetSelected(proxy.Name(), "")
+	// URLTest/Fallback may pin a member; clear before group delay so all are probed.
+	// Dart Smart also implements SelectAble, but preferred must survive delay sweeps.
+	if selectAble, ok := proxy.Adapter().(outboundgroup.SelectAble); ok {
+		switch proxy.Type() {
+		case C.Selector, C.Smart:
+			// keep selection / preferred
+		default:
+			selectAble.ForceSet("")
+			cachefile.Cache().SetSelected(proxy.Name(), "")
+		}
 	}
 
 	query := r.URL.Query()
