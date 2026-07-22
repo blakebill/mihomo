@@ -16,7 +16,9 @@ import (
 
 // SmartOption is optional config for type: smart groups.
 // dart-smart:options
-type SmartOption struct{}
+type SmartOption struct {
+	Mode string `group:"mode,omitempty"`
+}
 
 // Smart is a Dart Smart proxy-group with connection-level dial failover.
 type Smart struct {
@@ -25,10 +27,11 @@ type Smart struct {
 	selected   string
 	disableUDP bool
 	testUrl    string
+	mode       string
 }
 
 // dart-smart:constructor
-func NewSmart(option GroupCommonOption, _ SmartOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*Smart, error) {
+func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*Smart, error) {
 	if emptyFallback == nil {
 		return nil, errors.New("empty fallback proxy not exist")
 	}
@@ -49,6 +52,7 @@ func NewSmart(option GroupCommonOption, _ SmartOption, emptyFallback C.Proxy, pr
 		}),
 		disableUDP: option.DisableUDP,
 		testUrl:    option.URL,
+		mode:       smartOption.Mode,
 	}
 	return s, nil
 }
@@ -59,7 +63,7 @@ func (s *Smart) ensureEngine(proxies []C.Proxy) {
 		tags = append(tags, p.Name())
 	}
 	if s.eng == nil {
-		s.eng = engine.New(tags, engine.Options{})
+		s.eng = engine.New(tags, engine.OptionsForMode(s.mode))
 		if s.selected != "" {
 			s.eng.SetPreferred(s.selected)
 		}
@@ -148,7 +152,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 	s.ensureEngine(proxies)
 	host := s.hostKey(metadata)
 	var lastErr error
-	for _, candidate := range s.eng.Select(host) {
+	for _, candidate := range s.eng.SelectFor(host, engine.NetworkTCP) {
 		proxy := s.proxyByName(proxies, candidate.Tag)
 		if proxy == nil {
 			continue
@@ -157,7 +161,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 		c, err := proxy.DialContext(ctx, metadata)
 		rttMs := float64(time.Since(start).Milliseconds())
 		if err != nil {
-			s.eng.Record(candidate.Tag, engine.OutcomeFailure, rttMs)
+			s.eng.RecordFor(host, engine.NetworkTCP, candidate.Tag, engine.OutcomeFailure, rttMs)
 			s.onDialFailed(proxy.Type(), err, nil)
 			lastErr = err
 			continue
@@ -165,7 +169,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 		threshold := s.eng.SoftFailThresholdMs(candidate.Tag)
 		if rttMs > threshold && threshold > 0 {
 			_ = c.Close()
-			s.eng.Record(candidate.Tag, engine.OutcomeSoftFail, rttMs)
+			s.eng.RecordFor(host, engine.NetworkTCP, candidate.Tag, engine.OutcomeSoftFail, rttMs)
 			lastErr = errors.New("smart soft-fail: " + candidate.Tag)
 			continue
 		}
@@ -179,32 +183,40 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			c = callback.NewFirstWriteCallBackConn(c, func(err error) {
 				hsMs := float64(time.Since(hsStart).Milliseconds())
 				if err != nil {
-					s.eng.Record(tag, engine.OutcomeFailure, hsMs)
+					s.eng.RecordFor(hostKey, engine.NetworkTCP, tag, engine.OutcomeFailure, hsMs)
 					return
 				}
 				th := s.eng.SoftFailThresholdMs(tag)
 				if hsMs > th && th > 0 {
 					// Write already completed; keep the conn but mark soft-fail for ranking.
-					s.eng.Record(tag, engine.OutcomeSoftFail, hsMs)
+					s.eng.RecordFor(hostKey, engine.NetworkTCP, tag, engine.OutcomeSoftFail, hsMs)
 					return
 				}
-				s.eng.Record(tag, engine.OutcomeSuccess, hsMs)
-				s.eng.RememberHost(hostKey, tag)
+				s.eng.RecordFor(hostKey, engine.NetworkTCP, tag, engine.OutcomeSuccess, hsMs)
+				s.eng.RememberHostFor(hostKey, engine.NetworkTCP, tag)
 			})
 			s.selected = tag
 			s.onDialSuccess()
+			c = s.observeFirstByte(c, hostKey, tag)
 			return c, nil
 		}
-		s.eng.Record(candidate.Tag, engine.OutcomeSuccess, rttMs)
-		s.eng.RememberHost(host, candidate.Tag)
+		s.eng.RecordFor(host, engine.NetworkTCP, candidate.Tag, engine.OutcomeSuccess, rttMs)
+		s.eng.RememberHostFor(host, engine.NetworkTCP, candidate.Tag)
 		s.selected = candidate.Tag
 		s.onDialSuccess()
+		c = s.observeFirstByte(c, host, candidate.Tag)
 		return c, nil
 	}
 	if lastErr != nil {
 		return nil, lastErr
 	}
 	return s.EmptyFallback().DialContext(ctx, metadata)
+}
+
+func (s *Smart) observeFirstByte(conn C.Conn, host, tag string) C.Conn {
+	return newFirstByteObserveConn(conn, func(err error, latencyMs float64) {
+		s.eng.RecordFirstByteFor(host, engine.NetworkTCP, tag, err == nil, latencyMs)
+	})
 }
 
 // ListenPacketContext implements C.ProxyAdapter.
@@ -219,7 +231,7 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 	s.ensureEngine(proxies)
 	host := s.hostKey(metadata)
 	var lastErr error
-	for _, candidate := range s.eng.Select(host) {
+	for _, candidate := range s.eng.SelectFor(host, engine.NetworkUDP) {
 		proxy := s.proxyByName(proxies, candidate.Tag)
 		if proxy == nil || !proxy.SupportUDP() {
 			continue
@@ -228,13 +240,13 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		pc, err := proxy.ListenPacketContext(ctx, metadata)
 		rttMs := float64(time.Since(start).Milliseconds())
 		if err != nil {
-			s.eng.Record(candidate.Tag, engine.OutcomeFailure, rttMs)
+			s.eng.RecordFor(host, engine.NetworkUDP, candidate.Tag, engine.OutcomeFailure, rttMs)
 			lastErr = err
 			continue
 		}
 		pc.AppendToChains(s)
-		s.eng.Record(candidate.Tag, engine.OutcomeSuccess, rttMs)
-		s.eng.RememberHost(host, candidate.Tag)
+		s.eng.RecordFor(host, engine.NetworkUDP, candidate.Tag, engine.OutcomeSuccess, rttMs)
+		s.eng.RememberHostFor(host, engine.NetworkUDP, candidate.Tag)
 		s.selected = candidate.Tag
 		return pc, nil
 	}
@@ -323,4 +335,3 @@ func (s *Smart) Proxies() []C.Proxy {
 func (s *Smart) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {
 	return s.GroupBase.URLTest(ctx, url, expectedStatus)
 }
-

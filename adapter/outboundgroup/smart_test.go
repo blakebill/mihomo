@@ -141,3 +141,35 @@ func TestSmartDialContextFallsBackWhenAllFail(t *testing.T) {
 		t.Fatal("expected error when all members fail")
 	}
 }
+
+func TestFirstByteObserveConn(t *testing.T) {
+	t.Parallel()
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	adapter := &mockProxy{Base: outbound.NewBase(outbound.BaseOption{Name: "first-byte", Type: C.Direct})}
+	observed := make(chan error, 1)
+	conn := newFirstByteObserveConn(outbound.NewConn(client, adapter), func(err error, _ float64) {
+		observed <- err
+	})
+	go func() {
+		buffer := make([]byte, 4)
+		_, _ = server.Read(buffer)
+		_, _ = server.Write([]byte("ok"))
+	}()
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buffer := make([]byte, 2)
+	if _, err := conn.Read(buffer); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	select {
+	case err := <-observed:
+		if err != nil {
+			t.Fatalf("first byte marked failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first-byte observation timed out")
+	}
+}
