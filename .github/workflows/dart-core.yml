@@ -1,4 +1,4 @@
-# Build CURRENT Meta branch (includes Smart) and publish a Windows GitHub Release.
+# Build the current stable-based Meta branch (includes Smart) and publish Windows.
 name: Dart Core Release
 
 on:
@@ -15,8 +15,6 @@ on:
         description: "Optional full Dart version (e.g. 1.19.29-dart.4). Empty = auto."
         required: false
         type: string
-  schedule:
-    - cron: "37 3 * * *"
 
 permissions:
   contents: write
@@ -34,6 +32,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Verify Dart Smart is present
         shell: pwsh
@@ -56,29 +55,123 @@ jobs:
         id: version
         shell: pwsh
         env:
+          GH_TOKEN: ${{ github.token }}
           REQUESTED_VERSION: ${{ inputs.version }}
         run: |
+          $ErrorActionPreference = "Stop"
           $req = ""
           if ($env:REQUESTED_VERSION) {
             $req = $env:REQUESTED_VERSION.Trim().TrimStart('v')
           }
-          if ($req) {
-            $version = $req
-          } else {
-            $base = ""
-            try {
-              $base = (git describe --tags --match "v[0-9]*" --abbrev=0).Trim().TrimStart('v')
-            } catch {}
-            if (-not $base) { $base = "0.0.0" }
-            # Strip previous -dart.N so every run gets a unique tag
-            $base = [regex]::Replace($base, '-dart\.[0-9]+$', '')
-            $version = "$base-dart.${{ github.run_number }}"
+
+          $stableCandidates = @()
+          $reachableTags = @(git tag --merged HEAD --list "v*")
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to enumerate release tags reachable from HEAD"
           }
+          foreach ($tagLine in $reachableTags) {
+            $tag = $tagLine.Trim()
+            if ($tag -match '^v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))$') {
+              $stableCandidates += [PSCustomObject]@{
+                Tag = $tag
+                Version = [version]$Matches[1]
+              }
+            }
+          }
+          if ($stableCandidates.Count -eq 0) {
+            throw "HEAD is not based on a stable semantic-version release tag"
+          }
+          $stable = $stableCandidates |
+            Sort-Object Version |
+            Select-Object -Last 1
+          $base = $stable.Tag.Substring(1)
+
+          function Test-CompleteRelease {
+            param(
+              [Parameter(Mandatory = $true)][string]$ReleaseTag,
+              [Parameter(Mandatory = $true)][string]$Version
+            )
+
+            $releaseJson = & gh api `
+              "repos/$env:GITHUB_REPOSITORY/releases/tags/$ReleaseTag" 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              return $false
+            }
+            try {
+              $release = ($releaseJson -join "`n") | ConvertFrom-Json -Depth 10
+            } catch {
+              return $false
+            }
+            if ($release.draft -or $release.prerelease) {
+              return $false
+            }
+
+            $archiveName = "mihomo-windows-amd64-v$Version.zip"
+            $archive = @($release.assets | Where-Object { $_.name -eq $archiveName })[0]
+            $checksums = @($release.assets | Where-Object { $_.name -eq "SHA256SUMS.txt" })[0]
+            return (
+              $null -ne $archive -and [int64]$archive.size -gt 0 -and
+              $null -ne $checksums -and [int64]$checksums.size -gt 0
+            )
+          }
+
+          if ($req) {
+            if ($req -notmatch '^((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))-dart\.[1-9][0-9]*$') {
+              throw "Requested version must look like 1.19.29-dart.4"
+            }
+            if ($Matches[1] -ne $base) {
+              throw "Requested version base $($Matches[1]) does not match reachable stable $base"
+            }
+            $version = $req
+            $existingCommit = & git rev-parse -q --verify "refs/tags/v$version^{commit}" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $existingCommit = ($existingCommit | Select-Object -First 1).Trim()
+              $headCommit = (git rev-parse HEAD).Trim()
+              if ($existingCommit -ne $headCommit) {
+                throw "Requested tag v$version already points at $existingCommit, not $headCommit"
+              }
+            } elseif ($LASTEXITCODE -ne 1) {
+              throw "Unable to inspect requested tag v$version"
+            }
+            $shouldBuild = "true"
+          } else {
+            $existingTags = @(
+              git tag --points-at HEAD --list "v$base-dart.*" |
+                ForEach-Object {
+                  if ($_ -match "^v$([regex]::Escape($base))-dart\.([1-9][0-9]*)$") {
+                    [PSCustomObject]@{
+                      Tag = $_
+                      Sequence = [int64]$Matches[1]
+                    }
+                  }
+                } |
+                Sort-Object Sequence
+            )
+            if ($existingTags.Count -gt 0) {
+              $version = $existingTags[-1].Tag.Trim().TrimStart('v')
+              if (Test-CompleteRelease -ReleaseTag "v$version" -Version $version) {
+                $shouldBuild = "false"
+                Write-Host "Commit already has complete release v$version; skipping duplicate build."
+              } else {
+                # Reuse the existing tag/version so Publish can create the
+                # missing release or replace incomplete assets with --clobber.
+                $shouldBuild = "true"
+                Write-Host "Release v$version is absent or incomplete; repairing publication."
+              }
+            } else {
+              $version = "$base-dart.${{ github.run_number }}"
+              $shouldBuild = "true"
+            }
+          }
+
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=v$version" >> $env:GITHUB_OUTPUT
-          Write-Host "version=$version tag=v$version sha=$(git rev-parse --short HEAD)"
+          "stable_tag=$($stable.Tag)" >> $env:GITHUB_OUTPUT
+          "should_build=$shouldBuild" >> $env:GITHUB_OUTPUT
+          Write-Host "stable=$($stable.Tag) version=$version build=$shouldBuild sha=$(git rev-parse --short HEAD)"
 
       - name: Test Smart
+        if: steps.version.outputs.should_build == 'true'
         shell: pwsh
         env:
           CGO_ENABLED: "0"
@@ -91,6 +184,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Compile packages
+        if: steps.version.outputs.should_build == 'true'
         shell: pwsh
         env:
           CGO_ENABLED: "0"
@@ -101,6 +195,7 @@ jobs:
         run: go test ./... -tags with_gvisor -run "^$" -count=0
 
       - name: Build Windows core
+        if: steps.version.outputs.should_build == 'true'
         shell: pwsh
         env:
           CGO_ENABLED: "0"
@@ -117,6 +212,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify and package
+        if: steps.version.outputs.should_build == 'true'
         id: package
         shell: pwsh
         env:
@@ -135,15 +231,17 @@ jobs:
           "archive=$archive" >> $env:GITHUB_OUTPUT
 
       - name: Publish GitHub Release
+        if: steps.version.outputs.should_build == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          STABLE_TAG: ${{ steps.version.outputs.stable_tag }}
           ARCHIVE: ${{ steps.package.outputs.archive }}
         run: |
           set -euo pipefail
-          notes="Dart-maintained Windows amd64 mihomo (Meta) with Smart group. Commit $(git rev-parse --short HEAD)."
+          notes="Dart-maintained Windows amd64 mihomo (Meta) with Smart group, based on upstream stable $STABLE_TAG. Commit $(git rev-parse --short HEAD)."
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \
               "dist/$ARCHIVE" \
@@ -151,6 +249,7 @@ jobs:
               --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
               --title "Mihomo $VERSION for Dart" --notes "$notes" \
+              --draft=false --prerelease=false \
               --target "$(git rev-parse HEAD)"
           else
             gh release create "$RELEASE_TAG" \

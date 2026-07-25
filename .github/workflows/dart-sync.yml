@@ -1,6 +1,5 @@
-# Merge MetaCubeX upstream into Meta, keep Smart, push.
-# Push to Meta triggers Dart Core Release.
-name: Sync upstream with Dart Smart
+# Merge the latest stable MetaCubeX release into Meta, keep Smart, then publish.
+name: Sync upstream stable with Dart Smart
 
 on:
   workflow_dispatch:
@@ -8,6 +7,7 @@ on:
     - cron: "27 3 * * *"
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Merge upstream Meta/Alpha
+    name: Merge upstream stable release
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -24,34 +24,75 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
           fetch-depth: 0
+          fetch-tags: true
           ref: Meta
 
-      - name: Configure repositories
+      - name: Resolve upstream stable release
+        id: stable
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/MetaCubeX/mihomo.git 2>/dev/null || \
             git remote set-url upstream https://github.com/MetaCubeX/mihomo.git
-          if git ls-remote --heads upstream Meta | grep -q refs/heads/Meta; then
-            BRANCH=Meta
-          else
-            BRANCH=Alpha
-          fi
-          echo "UPSTREAM_BRANCH=$BRANCH" >> "$GITHUB_ENV"
-          git fetch --no-tags upstream "$BRANCH"
 
-      - name: Merge upstream
+          # Upstream's release workflow advances Meta to the released commit.
+          # Require that commit to carry an exact stable semver tag; never fall
+          # back to the continuously moving Alpha branch.
+          stable_ref="$(git ls-remote --heads upstream refs/heads/Meta)"
+          if [[ ! "$stable_ref" =~ ^([0-9a-f]{40})[[:space:]]+refs/heads/Meta$ ]]; then
+            echo "::error::Unable to resolve the upstream stable Meta branch"
+            exit 1
+          fi
+          stable_commit="${BASH_REMATCH[1]}"
+
+          stable_tags="$(
+            git ls-remote --tags upstream 'refs/tags/v*' |
+              while read -r object ref; do
+                [[ "$object" == "$stable_commit" ]] || continue
+                candidate="${ref#refs/tags/}"
+                candidate="${candidate%\^\{\}}"
+                if [[ "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                  echo "$candidate"
+                fi
+              done |
+              sort -Vu
+          )"
+          if [[ -z "$stable_tags" ]]; then
+            echo "::error::Upstream Meta $stable_commit has no exact stable semver tag"
+            exit 1
+          fi
+          tag="$(printf '%s\n' "$stable_tags" | tail -n 1)"
+
+          # Fetch only the tag proven to point at the stable branch head.
+          # Refuse a conflicting local tag instead of silently replacing provenance.
+          git fetch --no-tags upstream "refs/tags/${tag}:refs/tags/${tag}"
+          commit="$(git rev-parse "${tag}^{commit}")"
+          if [[ "$commit" != "$stable_commit" ]]; then
+            echo "::error::Stable tag $tag resolved to $commit, expected $stable_commit"
+            exit 1
+          fi
+          echo "UPSTREAM_TAG=$tag" >> "$GITHUB_ENV"
+          echo "UPSTREAM_COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Resolved upstream stable release $tag at $commit"
+
+      - name: Merge upstream stable release
+        id: merge
         run: |
           set -euo pipefail
-          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
-            echo "Already up to date with upstream/${UPSTREAM_BRANCH}."
+          if git merge-base --is-ancestor "$UPSTREAM_COMMIT" HEAD; then
+            echo "Already contains upstream stable $UPSTREAM_TAG."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           else
-            git merge --no-ff "upstream/${UPSTREAM_BRANCH}" \
-              -m "chore: sync upstream ${UPSTREAM_BRANCH}"
+            git merge --no-ff "$UPSTREAM_TAG" \
+              -m "chore: sync upstream stable ${UPSTREAM_TAG}"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Verify Dart Smart registration hooks
+        if: steps.merge.outputs.changed == 'true'
         run: |
           set -euo pipefail
           test -f adapter/outboundgroup/smart.go
@@ -60,6 +101,7 @@ jobs:
           grep -E -q $'\tSmart$' constant/adapters.go || grep -Fq $'\tSmart' constant/adapters.go
 
       - name: Set up Go
+        if: steps.merge.outputs.changed == 'true'
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with:
           go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
@@ -67,6 +109,7 @@ jobs:
           cache: true
 
       - name: Test Smart + smoke compile
+        if: steps.merge.outputs.changed == 'true'
         env:
           CGO_ENABLED: "0"
           GOTOOLCHAIN: local
@@ -77,8 +120,63 @@ jobs:
           go test ./adapter/outboundgroup/ -run 'Smart' -count=1
           go test ./... -tags with_gvisor -run "^$" -count=0
 
-      - name: Push Meta
+      - name: Push stable sync
         run: |
           set -euo pipefail
-          git push origin HEAD:Meta
-          # Pushing Meta triggers Dart Core Release.
+          if [[ "${{ steps.merge.outputs.changed }}" == "true" ]]; then
+            git push --atomic origin \
+              HEAD:Meta \
+              "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
+          else
+            # Keep the stable provenance tag mirrored even when the commit was
+            # already merged manually.
+            git push origin \
+              "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
+          fi
+
+      - name: Check whether this commit needs a core release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${UPSTREAM_TAG#v}"
+          pattern="^v${version//./\\.}-dart\\.[1-9][0-9]*$"
+
+          dart_tags="$(
+            git tag --points-at HEAD --list "v${version}-dart.*" |
+              while read -r candidate; do
+                [[ "$candidate" =~ $pattern ]] && echo "$candidate"
+              done |
+              sort -V
+          )"
+          if [[ -z "$dart_tags" ]]; then
+            echo "No stable Dart release points at $(git rev-parse --short HEAD)."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          release_tag="$(printf '%s\n' "$dart_tags" | tail -n 1)"
+          archive="mihomo-windows-amd64-${release_tag}.zip"
+          if release_json="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${release_tag}" 2>/dev/null)" &&
+            jq -e --arg archive "$archive" '
+              (.draft == false and .prerelease == false) and
+              any(.assets[]?; .name == $archive and (.size // 0) > 0) and
+              any(.assets[]?; .name == "SHA256SUMS.txt" and (.size // 0) > 0)
+            ' <<<"$release_json" >/dev/null; then
+            echo "Complete release $release_tag already publishes $(git rev-parse --short HEAD)."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $release_tag is absent or incomplete; publication will be repaired."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Pushes made with GITHUB_TOKEN do not recursively start push workflows.
+      # An explicit dispatch also lets the next scheduled sync retry a failed
+      # publication until a Dart release tag points at the current commit.
+      - name: Dispatch Dart Core Release
+        if: steps.release.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run dart-core.yml --repo "$GITHUB_REPOSITORY" --ref Meta
