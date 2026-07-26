@@ -91,14 +91,17 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Verify Dart Smart registration hooks
+      - name: Verify Dart customizations
         if: steps.merge.outputs.changed == 'true'
         run: |
           set -euo pipefail
           test -f adapter/outboundgroup/smart.go
           test -d adapter/outboundgroup/smartengine
+          test -f common/dialfeedback/feedback.go
+          test -f hub/route/dart.go
           grep -Fq 'case "smart":' adapter/outboundgroup/parser.go
           grep -E -q $'\tSmart$' constant/adapters.go || grep -Fq $'\tSmart' constant/adapters.go
+          grep -Fq 'r.Mount("/dart", dartRouter())' hub/route/server.go
 
       - name: Set up Go
         if: steps.merge.outputs.changed == 'true'
@@ -108,7 +111,7 @@ jobs:
           go-version: "1.26"
           cache: true
 
-      - name: Test Smart + smoke compile
+      - name: Test Smart, dial feedback, and smoke compile
         if: steps.merge.outputs.changed == 'true'
         env:
           CGO_ENABLED: "0"
@@ -116,6 +119,9 @@ jobs:
           SKIP_INTEROP_TEST: "1"
         run: |
           set -euo pipefail
+          go test ./common/callback -run 'FirstWrite' -count=1
+          go test ./common/dialfeedback -count=1
+          go test ./hub/route -run 'DartDialFeedback' -count=1
           go test ./adapter/outboundgroup/smartengine/... -count=1
           go test ./adapter/outboundgroup/ -run 'Smart' -count=1
           go test ./... -tags with_gvisor -run "^$" -count=0

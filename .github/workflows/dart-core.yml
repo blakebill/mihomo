@@ -34,15 +34,19 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Verify Dart Smart is present
+      - name: Verify Dart customizations
         shell: pwsh
         run: |
           if (-not (Test-Path "adapter/outboundgroup/smart.go")) { throw "missing smart.go" }
           if (-not (Test-Path "adapter/outboundgroup/smartengine")) { throw "missing smartengine" }
+          if (-not (Test-Path "common/dialfeedback/feedback.go")) { throw "missing dial feedback store" }
+          if (-not (Test-Path "hub/route/dart.go")) { throw "missing Dart API route" }
           $adapters = Get-Content "constant/adapters.go" -Raw
           if ($adapters -notmatch '(?m)^\s*Smart\s*$') { throw "Smart type not registered" }
           $parser = Get-Content "adapter/outboundgroup/parser.go" -Raw
           if ($parser -notmatch 'case "smart":') { throw "parser missing case smart" }
+          $routes = Get-Content "hub/route/server.go" -Raw
+          if ($routes -notmatch 'r\.Mount\("/dart", dartRouter\(\)\)') { throw "Dart API route not registered" }
 
       - name: Set up Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
@@ -170,7 +174,7 @@ jobs:
           "should_build=$shouldBuild" >> $env:GITHUB_OUTPUT
           Write-Host "stable=$($stable.Tag) version=$version build=$shouldBuild sha=$(git rev-parse --short HEAD)"
 
-      - name: Test Smart
+      - name: Test Smart and dial feedback
         if: steps.version.outputs.should_build == 'true'
         shell: pwsh
         env:
@@ -178,6 +182,12 @@ jobs:
           GOTOOLCHAIN: local
           SKIP_INTEROP_TEST: "1"
         run: |
+          go test ./common/callback -run "FirstWrite" -count=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test ./common/dialfeedback -count=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test ./hub/route -run "DartDialFeedback" -count=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           go test ./adapter/outboundgroup/smartengine/... -count=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           go test ./adapter/outboundgroup/ -run "Smart" -count=1
@@ -241,7 +251,7 @@ jobs:
           ARCHIVE: ${{ steps.package.outputs.archive }}
         run: |
           set -euo pipefail
-          notes="Dart-maintained Windows amd64 mihomo (Meta) with Smart group, based on upstream stable $STABLE_TAG. Commit $(git rev-parse --short HEAD)."
+          notes="Dart-maintained Windows amd64 mihomo (Meta) with Smart group and privacy-safe dial feedback API, based on upstream stable $STABLE_TAG. Commit $(git rev-parse --short HEAD)."
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" \
               "dist/$ARCHIVE" \

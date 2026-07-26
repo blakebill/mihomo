@@ -1,7 +1,9 @@
 package outboundgroup
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"sync/atomic"
@@ -11,6 +13,7 @@ import (
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/adapter/outboundgroup/smartengine"
+	"github.com/metacubex/mihomo/common/dialfeedback"
 	C "github.com/metacubex/mihomo/constant"
 )
 
@@ -139,6 +142,36 @@ func TestSmartDialContextFallsBackWhenAllFail(t *testing.T) {
 	// Reject emptyFallback also fails — either last dial error or reject is fine.
 	if err == nil {
 		t.Fatal("expected error when all members fail")
+	}
+}
+
+func TestSmartDialContextRecordsPrivacySafeFeedback(t *testing.T) {
+	proxy := adapter.NewProxy(&mockProxy{
+		Base: outbound.NewBase(outbound.BaseOption{Name: "feedback-node", Type: C.Direct}),
+	})
+	s := newSmartWithProxies(t, proxy)
+	startSequence := dialfeedback.Default.SnapshotSince(0).Sequence
+	meta := &C.Metadata{Host: "private.example", DstPort: 443}
+	conn, err := s.DialContext(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	_ = conn.Close()
+
+	events := dialfeedback.Default.SnapshotSince(startSequence).Events
+	if len(events) != 1 {
+		t.Fatalf("events=%d want 1: %#v", len(events), events)
+	}
+	event := events[0]
+	if event.Group != "smart-test" || event.Outbound != "feedback-node" || !event.Success || event.Network != "tcp" {
+		t.Fatalf("unexpected feedback: %#v", event)
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal feedback: %v", err)
+	}
+	if bytes.Contains(payload, []byte("private.example")) {
+		t.Fatalf("feedback leaked target: %s", payload)
 	}
 }
 
