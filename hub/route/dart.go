@@ -28,5 +28,9 @@ func getDialFeedback(w http.ResponseWriter, r *http.Request) {
 		}
 		since = parsed
 	}
+	if r.URL.Query().Get("signals") == "1" {
+		render.JSON(w, r, dialfeedback.Default.SnapshotDetailedSince(since))
+		return
+	}
 	render.JSON(w, r, dialfeedback.Default.SnapshotSince(since))
 }

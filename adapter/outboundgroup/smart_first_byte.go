@@ -18,10 +18,10 @@ type firstByteObserveConn struct {
 	requestAt   time.Time
 	armed       atomic.Bool
 	observed    atomic.Bool
-	onFirstByte func(err error, latencyMs float64)
+	onFirstByte func(err error, latency time.Duration)
 }
 
-func newFirstByteObserveConn(conn C.Conn, callback func(error, float64)) C.Conn {
+func newFirstByteObserveConn(conn C.Conn, callback func(error, time.Duration)) C.Conn {
 	return &firstByteObserveConn{Conn: conn, onFirstByte: callback}
 }
 
@@ -37,9 +37,9 @@ func (c *firstByteObserveConn) observe(err error) {
 		return
 	}
 	c.arm()
-	latencyMs := float64(time.Since(c.requestAt).Milliseconds())
+	latency := time.Since(c.requestAt)
 	if c.onFirstByte != nil {
-		c.onFirstByte(err, latencyMs)
+		c.onFirstByte(err, latency)
 	}
 }
 

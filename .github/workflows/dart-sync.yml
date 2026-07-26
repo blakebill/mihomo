@@ -102,6 +102,8 @@ jobs:
           grep -Fq 'case "smart":' adapter/outboundgroup/parser.go
           grep -E -q $'\tSmart$' constant/adapters.go || grep -Fq $'\tSmart' constant/adapters.go
           grep -Fq 'r.Mount("/dart", dartRouter())' hub/route/server.go
+          grep -Fq 'Get("signals") == "1"' hub/route/dart.go
+          grep -Fq '"first-byte"' adapter/outboundgroup/smart.go
 
       - name: Set up Go
         if: steps.merge.outputs.changed == 'true'

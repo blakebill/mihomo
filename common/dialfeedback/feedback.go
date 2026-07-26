@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,6 +20,7 @@ type Event struct {
 	Group      string `json:"group,omitempty"`
 	Outbound   string `json:"outbound"`
 	Network    string `json:"network,omitempty"`
+	Signal     string `json:"signal"`
 	Success    bool   `json:"success"`
 	DurationMs int64  `json:"durationMs"`
 	Timestamp  int64  `json:"timestamp"`
@@ -31,12 +33,50 @@ type Snapshot struct {
 	Events   []Event `json:"events"`
 }
 
-// Store is a fixed-size, concurrency-safe circular event buffer.
+type eventRing struct {
+	events []Event
+	start  int
+	count  int
+}
+
+func newEventRing(capacity int) eventRing {
+	return eventRing{events: make([]Event, capacity)}
+}
+
+func (r *eventRing) add(event Event) {
+	index := (r.start + r.count) % len(r.events)
+	if r.count == len(r.events) {
+		index = r.start
+		r.start = (r.start + 1) % len(r.events)
+	} else {
+		r.count++
+	}
+	r.events[index] = event
+}
+
+func (r *eventRing) snapshotSince(since uint64) []Event {
+	eventCount := 0
+	for index := 0; index < r.count; index++ {
+		if r.events[(r.start+index)%len(r.events)].Sequence > since {
+			eventCount++
+		}
+	}
+	events := make([]Event, 0, eventCount)
+	for index := 0; index < r.count; index++ {
+		event := r.events[(r.start+index)%len(r.events)]
+		if event.Sequence > since {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
+// Store keeps independent fixed-size detailed and legacy rings. Supplemental
+// stage signals cannot reduce the original GUI's 256-attempt retention.
 type Store struct {
 	mu       sync.RWMutex
-	events   []Event
-	start    int
-	count    int
+	detailed eventRing
+	legacy   eventRing
 	sequence uint64
 	instance string
 }
@@ -46,7 +86,8 @@ func NewStore(capacity int) *Store {
 		capacity = 1
 	}
 	return &Store{
-		events:   make([]Event, capacity),
+		detailed: newEventRing(capacity),
+		legacy:   newEventRing(capacity),
 		instance: newInstanceID(),
 	}
 }
@@ -62,22 +103,43 @@ func newInstanceID() string {
 }
 
 func (s *Store) Add(group, outbound, network string, success bool, duration time.Duration, errorClass string) {
+	s.add(group, outbound, network, "", success, duration, duration, errorClass, true)
+}
+
+func (s *Store) AddLegacySignal(group, outbound, network, signal string, success bool, duration time.Duration, errorClass string) {
+	s.add(group, outbound, network, signal, success, duration, duration, errorClass, true)
+}
+
+func (s *Store) AddLegacySignalDurations(
+	group, outbound, network, signal string,
+	success bool,
+	detailedDuration, legacyDuration time.Duration,
+	errorClass string,
+) {
+	s.add(group, outbound, network, signal, success, detailedDuration, legacyDuration, errorClass, true)
+}
+
+func (s *Store) AddSupplementalSignal(group, outbound, network, signal string, success bool, duration time.Duration, errorClass string) {
+	s.add(group, outbound, network, signal, success, duration, duration, errorClass, false)
+}
+
+func (s *Store) add(
+	group, outbound, network, signal string,
+	success bool,
+	detailedDuration, legacyDuration time.Duration,
+	errorClass string,
+	legacy bool,
+) {
 	if s == nil || outbound == "" {
 		return
-	}
-	var durationMs int64
-	if duration > 0 {
-		durationMs = int64((duration + 500*time.Microsecond) / time.Millisecond)
-		if durationMs < 1 {
-			durationMs = 1
-		}
 	}
 	event := Event{
 		Group:      group,
 		Outbound:   outbound,
 		Network:    network,
+		Signal:     normalizeSignal(signal, network),
 		Success:    success,
-		DurationMs: durationMs,
+		DurationMs: durationMillis(detailedDuration),
 		Timestamp:  time.Now().UnixMilli(),
 		ErrorClass: normalizeErrorClass(success, errorClass),
 	}
@@ -86,39 +148,64 @@ func (s *Store) Add(group, outbound, network string, success bool, duration time
 	defer s.mu.Unlock()
 	s.sequence++
 	event.Sequence = s.sequence
-
-	index := (s.start + s.count) % len(s.events)
-	if s.count == len(s.events) {
-		index = s.start
-		s.start = (s.start + 1) % len(s.events)
-	} else {
-		s.count++
+	s.detailed.add(event)
+	if legacy {
+		event.DurationMs = durationMillis(legacyDuration)
+		s.legacy.add(event)
 	}
-	s.events[index] = event
 }
 
 func (s *Store) SnapshotSince(since uint64) Snapshot {
+	return s.snapshotSince(since, true)
+}
+
+// SnapshotLegacySince is an explicit alias for the original exported API.
+func (s *Store) SnapshotLegacySince(since uint64) Snapshot {
+	return s.SnapshotSince(since)
+}
+
+// SnapshotDetailedSince returns the opt-in stage-specific outcome stream.
+func (s *Store) SnapshotDetailedSince(since uint64) Snapshot {
+	return s.snapshotSince(since, false)
+}
+
+func (s *Store) snapshotSince(since uint64, legacyOnly bool) Snapshot {
 	if s == nil {
 		return Snapshot{Events: []Event{}}
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.count == 0 || since >= s.sequence {
+	if since >= s.sequence {
 		return Snapshot{Instance: s.instance, Sequence: s.sequence, Events: []Event{}}
 	}
-	oldestSequence := s.sequence - uint64(s.count) + 1
-	startSequence := oldestSequence
-	if since >= oldestSequence {
-		startSequence = since + 1
+	ring := &s.detailed
+	if legacyOnly {
+		ring = &s.legacy
 	}
-	offset := int(startSequence - oldestSequence)
-	events := make([]Event, 0, s.count-offset)
-	for i := offset; i < s.count; i++ {
-		event := s.events[(s.start+i)%len(s.events)]
-		events = append(events, event)
+	return Snapshot{Instance: s.instance, Sequence: s.sequence, Events: ring.snapshotSince(since)}
+}
+
+func durationMillis(duration time.Duration) int64 {
+	if duration <= 0 {
+		return 0
 	}
-	return Snapshot{Instance: s.instance, Sequence: s.sequence, Events: events}
+	durationMs := int64((duration + 500*time.Microsecond) / time.Millisecond)
+	if durationMs < 1 {
+		return 1
+	}
+	return durationMs
+}
+
+func normalizeSignal(signal, network string) string {
+	switch signal {
+	case "tcp", "udp", "handshake", "first-byte":
+		return signal
+	}
+	if strings.EqualFold(network, "udp") {
+		return "udp"
+	}
+	return "tcp"
 }
 
 func normalizeErrorClass(success bool, errorClass string) string {

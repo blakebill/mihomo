@@ -47,6 +47,10 @@ jobs:
           if ($parser -notmatch 'case "smart":') { throw "parser missing case smart" }
           $routes = Get-Content "hub/route/server.go" -Raw
           if ($routes -notmatch 'r\.Mount\("/dart", dartRouter\(\)\)') { throw "Dart API route not registered" }
+          $dartRoute = Get-Content "hub/route/dart.go" -Raw
+          if ($dartRoute -notmatch 'Get\("signals"\) == "1"') { throw "Dart staged signals opt-in missing" }
+          $smart = Get-Content "adapter/outboundgroup/smart.go" -Raw
+          if ($smart -notmatch '"first-byte"') { throw "Smart first-byte feedback missing" }
 
       - name: Set up Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
