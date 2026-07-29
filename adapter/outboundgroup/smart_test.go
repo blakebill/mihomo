@@ -14,7 +14,9 @@ import (
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/adapter/outboundgroup/smartengine"
 	"github.com/metacubex/mihomo/common/dialfeedback"
+	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
+	P "github.com/metacubex/mihomo/constant/provider"
 )
 
 type mockProxy struct {
@@ -22,6 +24,30 @@ type mockProxy struct {
 	fail  bool
 	delay time.Duration
 	calls *atomic.Int32
+}
+
+type smartHealthCheckProvider struct {
+	proxies      []C.Proxy
+	healthChecks atomic.Int32
+}
+
+func (*smartHealthCheckProvider) Name() string               { return "smart-health-check" }
+func (*smartHealthCheckProvider) VehicleType() P.VehicleType { return P.Compatible }
+func (*smartHealthCheckProvider) Type() P.ProviderType       { return P.Proxy }
+func (*smartHealthCheckProvider) Initial() error             { return nil }
+func (*smartHealthCheckProvider) Update() error              { return nil }
+func (p *smartHealthCheckProvider) Proxies() []C.Proxy       { return p.proxies }
+func (p *smartHealthCheckProvider) Count() int               { return len(p.proxies) }
+func (*smartHealthCheckProvider) Touch()                     {}
+func (p *smartHealthCheckProvider) HealthCheck()             { p.healthChecks.Add(1) }
+func (*smartHealthCheckProvider) Version() uint32            { return 1 }
+func (*smartHealthCheckProvider) HealthCheckURL() string     { return "" }
+func (*smartHealthCheckProvider) RegisterHealthCheckTask(
+	string,
+	utils.IntRanges[uint16],
+	string,
+	uint,
+) {
 }
 
 func (m *mockProxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
@@ -170,6 +196,39 @@ func TestSmartDialContextFallsBackWhenAllFail(t *testing.T) {
 	// Reject emptyFallback also fails — either last dial error or reject is fine.
 	if err == nil {
 		t.Fatal("expected error when all members fail")
+	}
+}
+
+func TestSmartDialFailuresTriggerHealthCheckWithoutPanic(t *testing.T) {
+	bad := adapter.NewProxy(&mockProxy{
+		Base: outbound.NewBase(outbound.BaseOption{Name: "bad", Type: C.Shadowsocks}),
+		fail: true,
+	})
+	pd := &smartHealthCheckProvider{proxies: []C.Proxy{bad}}
+	fb := adapter.NewProxy(outbound.NewReject())
+	s, err := NewSmart(GroupCommonOption{
+		Name:           "smart-health-check-test",
+		Type:           "smart",
+		MaxFailedTimes: 2,
+		TestTimeout:    5000,
+	}, SmartOption{}, fb, []P.ProxyProvider{pd})
+	if err != nil {
+		t.Fatalf("NewSmart: %v", err)
+	}
+
+	meta := &C.Metadata{Host: "example.com", DstPort: 443}
+	for i := 0; i < 2; i++ {
+		if _, err = s.DialContext(context.Background(), meta); err == nil {
+			t.Fatal("expected failing Smart member to return an error")
+		}
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for pd.healthChecks.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := pd.healthChecks.Load(); got != 1 {
+		t.Fatalf("health checks=%d want 1", got)
 	}
 }
 

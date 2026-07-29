@@ -191,7 +191,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 		if err != nil {
 			s.eng.RecordFor(host, engine.NetworkTCP, candidate.Tag, engine.OutcomeFailure, rttMs)
 			s.recordLegacyDialFeedback(candidate.Tag, string(engine.NetworkTCP), "tcp", false, elapsed, dialfeedback.ErrorClass(err))
-			s.onDialFailed(proxy.Type(), err, nil)
+			s.onDialFailed(proxy.Type(), err, s.healthCheck)
 			lastErr = err
 			continue
 		}

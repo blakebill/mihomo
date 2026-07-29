@@ -267,7 +267,7 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 		return
 	}
 
-	if errors.Is(err, C.ErrNotSupport) {
+	if errors.Is(err, C.ErrNotSupport) || fn == nil {
 		return
 	}
 
@@ -300,13 +300,16 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 }
 
 func (gb *GroupBase) healthCheck() {
-	if gb.failedTesting.Load() {
+	if !gb.failedTesting.CompareAndSwap(false, true) {
 		return
 	}
+	defer gb.failedTesting.Store(false)
 
-	gb.failedTesting.Store(true)
 	wg := sync.WaitGroup{}
 	for _, proxyProvider := range gb.providers {
+		if proxyProvider == nil {
+			continue
+		}
 		wg.Add(1)
 		proxyProvider := proxyProvider
 		go func() {
@@ -316,8 +319,9 @@ func (gb *GroupBase) healthCheck() {
 	}
 
 	wg.Wait()
-	gb.failedTesting.Store(false)
+	gb.failedTestMux.Lock()
 	gb.failedTimes = 0
+	gb.failedTestMux.Unlock()
 }
 
 func (gb *GroupBase) onDialSuccess() {
